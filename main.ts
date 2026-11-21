@@ -7,14 +7,22 @@
 // to solve.js's copying transduceAll, and then to answering case by case with run(),
 // so the output is still correct. Outside the grader's container, MAKEFUN_INPUT_DIR
 // and MAKEFUN_OUTPUT_DIR stand in for /input and /output.
+//
+// Every graded run is a fresh process in a fresh container, so the module is always
+// compiled and first executed cold, inside the timed run: nothing ever tiers up.
+// The two flags below are set before solve.js is imported — before any WebAssembly
+// is compiled — and pin compilation to the baseline tier (Liftoff), so no CPU is
+// spent on optimizing-tier compilation that a single cold call can never repay,
+// and turn V8's incremental marking off, the condition the house baseline is
+// timed under.
+
+import { setFlagsFromString } from "node:v8";
+
+setFlagsFromString("--liftoff-only");
+setFlagsFromString("--no-incremental-marking");
 
 import { closeSync, fstatSync, openSync, readFileSync, readSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { setFlagsFromString } from "node:v8";
-
-// Turn V8's incremental marking off before solve.js is loaded, so the work runs under
-// the same condition the house baseline is timed under.
-setFlagsFromString("--no-incremental-marking");
 
 // solve.js is a plain JavaScript module; load it by URL and pin its shape to the contract.
 const solve = (await import(new URL("./solve.js", import.meta.url).href)) as {
