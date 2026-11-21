@@ -1,4 +1,4 @@
-# csv-reader-speed-01 — entry v10
+# csv-reader-speed-01 — entry v11
 
 [![make.fun · csv-reader-speed-01-run-20261121](https://make.fun/badge/csv-reader-speed-01-run-20261121.svg)](https://make.fun/bounty/csv-reader-speed-01-run-20261121?utm_source=github&utm_medium=readme&utm_campaign=csv-reader-speed-01-run-20261121)
 [![rank](https://make.fun/badge/csv-reader-speed-01-run-20261121/jontumpil/makefun-csv-reader/rank.svg)](https://make.fun/bounty/csv-reader-speed-01-run-20261121/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=csv-reader-speed-01-run-20261121)
@@ -6,7 +6,8 @@
 
 **csv-reader 1.0.0's exact semantics, reimplemented as a Rust → WebAssembly
 JSON-to-JSON transducer over the whole cases envelope, with the driver
-moving the files without copying them.**
+moving the files without copying them — and a driver shell rebuilt for
+the way the runs are actually timed: every run a fresh, cold process.**
 
 For every case in `cases.json` the entry returns exactly what the reference
 `readCsv(text, header)` returns — `{columns, rows, errors}` — byte-identical
@@ -17,109 +18,151 @@ serialized three different ways), with zero mismatches.
 
 ## The shape of it
 
-`solve.js` embeds a small WebAssembly module (Rust source in `rust/`,
-no crates, standard library only) and exports the contract's `run(input)`.
-The module does everything: it scans the `cases.json` envelope, unescapes
-each case's text, runs the CSV state machine, and writes the answers array
-as raw bytes. JavaScript never parses the envelope and never sees a CSV
-value on the hot path.
+`solve.js` embeds a small WebAssembly module (46,232 bytes; Rust source in
+`rust/`, no crates, standard library only) and exports the contract's
+`run(input)`. The module does everything: it scans the `cases.json`
+envelope, unescapes each case's text, runs the CSV state machine, and
+writes the answers array as raw bytes. JavaScript never parses the
+envelope and never sees a CSV value on the hot path.
 
-`main.ts` is the same driver shape as the house baseline's, and stages the
-files through the module's own memory:
+`main.ts` stages the files through the module's own memory:
 
 1. it asks the module for its input pointer, reads `cases.json` from disk
    straight into a view over the module's memory (no intermediate JS
-   string or byte copy of an 11 MB envelope), and calls `transduceStaged`;
+   string or byte copy of a ~10 MB envelope), and calls `transduceStaged`;
 2. the module returns the answers as a pointer and a length, and the
    driver writes that slice of the module's memory straight to
    `answers.json`.
 
-One fallback is kept: if the input file is larger than the memory the
-module can address, the driver reads it the ordinary way and calls
-`transduceAll` instead; a case the transducer cannot answer (none is
-known) falls back to a JavaScript mirror of the reference reader, kept
-verbatim from the previous versions of this entry.
+If the staged path ever throws, the driver falls back to `transduceAll`
+over a normally-read buffer, and then to answering case by case with
+`run()` — the output is the same by construction, just slower.
 
-## The transducer (unchanged from v9 — it is the measured winner)
+## What v11 changes: the cold-run driver shell
+
+The transducer itself is v10's, byte for byte (the same Rust source; the
+rebuilt module is the same 46,232 bytes). v11's work is the shell around
+it, shaped by one fact about the timing: each timed run is a brand-new
+process in a brand-new container, the warm-up round happens in a
+different container, and the clock reads the child process's CPU. So a
+run is always cold — the module is compiled and first executed inside
+the timed run, and no optimizing tier ever gets a second call to repay
+its cost. Measured locally (see below), the v10 shell and the v11 shell
+tie; v11 ships the configuration that cannot waste cold-run CPU:
+
+- **Liftoff only, set before anything compiles.** `main.ts`'s first
+  statements set `--liftoff-only` (and `--no-incremental-marking`, the
+  condition the house baseline is timed under) through
+  `setFlagsFromString`, and only then dynamically imports `solve.js`.
+  No WebAssembly is compiled before the flags land, so no CPU goes to
+  TurboFan compilation a single cold call can never repay. (v10 set its
+  flag from inside the import path and kept a warm-up; retested
+  properly — flags first, warm-up gone — Liftoff-only ties the default
+  pipeline locally instead of losing, and it removes the cold-run waste
+  by construction.)
+- **No import-time warm-up.** v9/v10 ran a 1 KB transduction at import
+  to prime the optimizing tier. With the tier pinned off and every run
+  cold, the warm-up is pure overhead; it is gone.
+- **Synchronous instantiation.** `solve.js` builds its module with
+  `new WebAssembly.Module` / `new WebAssembly.Instance` instead of a
+  top-level `await WebAssembly.instantiate(...)`: the file has no
+  top-level await (so `require()` can load it too) and the module is
+  compiled exactly once, at load, under the driver's flags.
+- **`package.json` with `"type": "module"`.** The repo root carries it,
+  so `main.ts` and `solve.js` load as the ES modules they are instead of
+  paying Node's parse-as-CommonJS-then-reparse detection on every cold
+  start.
+
+## The transducer (v10's, the measured winner)
 
 - **The envelope** is scanned, not parsed: a forgiving cursor finds each
-  case's `"input"` object, its `"text"` string span and its `"header"`
-  literal, tolerating any key order and extra keys. The text string is
-  unescaped into a WTF-8 staging buffer (a lone surrogate becomes its
-  3-byte `ED A0..`/`ED B0..` form, so it round-trips exactly).
-- **The reader** is a byte-at-a-time state machine over the staged bytes
-  whose hot loops scan 8 bytes at a time (SWAR): one u64 load classifies
-  quotes, commas, CR and LF together. Plain fields copy out as spans;
-  quoted fields likewise between event bytes; a field with no event byte
-  at all is emitted from a single span. Values stream into the output
-  buffer as JSON — string escaping is decided 8 bytes at a time with a
-  256-entry class table — and the row/column width accounting runs on
-  counts taken during the scan, not on a second pass.
-- **The quirks are the semantics**: the leading-BOM strip (one code point,
-  before anything else, so a BOM inside the first quoted field still
-  counts), the dropped stray CR (and the astral pair that materializes
-  when the CR stood between two lone surrogates), junk after a closing
-  quote being swallowed to the next delimiter, rows padded with `""` to
-  the first row's width while `columns` follows the header or the first
-  row, and the exact error objects `{type, code, message, row}` —
-  `Quotes` ("Quoted field unterminated"), `FieldMismatch`
-  ("Too few fields: expected %d fields but parsed %d") with its
-  first-row-suppressed variant, and `Input` for a `null` text.
-- **One warm-up transduction** of a tiny representative envelope runs at
-  import time, so the module's hot functions are compiled before the
-  timed call rather than during it.
+  case's `"input"` object, unescapes its `"text"` string to WTF-8 (a
+  lone surrogate becomes its 3-byte `ED A0..`/`ED B0..` form, so it
+  round-trips exactly), and reads `"header"` as the JSON literal `true`,
+  tolerating any key order and extra keys.
+- **The reader** is a state machine over the staged bytes whose hot
+  loops scan 8 bytes at a time (SWAR): one u64 load classifies quotes,
+  commas, CR, LF and the bytes JSON would escape, together. Field values
+  are never materialized on the hot path — plain spans copy straight
+  into the output with escapes emitted inline — except the cut fields
+  of a `long_row` error, which take a slower value-building reader. The
+  first record is captured in a small buffer (whether it is the columns
+  or row 0 is known only when it completes); every later record streams
+  straight into the answer buffer, and a speculative record that turns
+  out to hold no characters is rolled back by truncation.
+- **The quirks are the semantics**: a leading U+FEFF is dropped; a record
+  ends at LF or CRLF and a line left with no characters is no record; a
+  CR outside quotes not followed by LF is dropped (`stray_cr`); a field
+  opening with a quote runs to the next undoubled quote (`""` is one
+  quote; CRLF and lone CR inside read as LF), what follows the closing
+  quote is appended as it stands (`quote_junk`); a quote that never
+  closes is a literal character and the text after it is re-read as
+  unquoted (`unterminated_quote`); rows are padded (`short_row`, with
+  `fields`) or cut (`long_row`, with `extra`) to the first record's
+  width; errors are `{code, line, row}` in the order met.
 
-## What v10 tried, measured interleaved against v9 in one session
+## What v11 tried, measured interleaved in single sessions
 
-Local harness: whole `main.ts` processes over the practice envelope
-(11,064,623 bytes in, 12,073,155 out), CPU time from `getrusage`, net of
-an empty house-style control process run in the same rotation; medians
-of 7–13 interleaved rounds. Absolute numbers drift on this machine;
-only same-session comparisons are meaningful. v9 nets ~110–125 ms in
-these sessions.
+Local harness: whole `main.ts` processes over the kit practice envelope
+(10,193,953 bytes in, ~12.1 MB out), CPU time from `getrusage`
+(RUSAGE_CHILDREN), net of a null control process (bare Node startup,
+directory list, empty write) in the same rotation; medians of 9–11
+interleaved rounds with fresh processes. This machine is throttled and
+its absolute numbers drift ±20 ms between sessions; only same-session
+comparisons are meaningful. In these sessions v10 nets ~113–124 ms.
 
-- **Read-side escape fusion — rejected.** The staging pass was removed:
-  the envelope walk records each text's raw span and a fused reader
-  consumes field content as bulk envelope spans wherever the span holds
-  no backslash, decoding escapes unit-by-unit only around actual escape
-  sequences, with v9's emission and accounting rules reused exactly
-  (span/escape event logic, pending-high surrogate handling, WTF-8
-  counting). It was correct — practice byte-identical — but slower in
-  both shapes tried: as a second reader beside the staged one (net
-  ~141 ms vs v9's ~115; the module grew 52 KB → 81 KB and import tripled)
-  and as the only reader (~135–153 ms vs ~114–123 across batches).
-  Removing the import warm-up made it worse still. The unescape pass is
-  memcpy-cheap; the fused machine pays per-escape dispatch and a larger
-  code footprint in the tier-up-critical first call. The staged design
-  stays.
-- **Separate `solve.wasm` file — measured neutral, not shipped.**
-  Loading via `readFileSync(new URL("./solve.wasm", import.meta.url))` +
-  `WebAssembly.instantiate` tied the embedded base64 loading in every
-  interleaved batch (import ~4.5 ms either way; nets within ±4 ms), and
-  the pair was verified working from a clean directory containing only
-  the shipped files. Synchronous `WebAssembly.Module`/`Instance`
-  construction tied as well. Because the gain is nil and an embedded
-  `solve.js` stays self-contained wherever the grader copies it, v10
-  keeps the v9 loading.
-- **Optimization level — "s" kept, "z" rejected.** `opt-level = "s"`
-  shrinks the module 52,387 → 46,232 bytes and was the most consistent
-  small win of the round (nets ~105–110 vs v9's ~110–125 in matched
-  batches). `opt-level = "z"` shrinks it to 32,428 bytes but gives the
-  hot loops back (net ~120). `opt-level = 3` ties 2, as v9 found.
-- **Driver trims — nothing measurable, two rejected.** Skipping the
-  input buffer's zero-fill in `in_ptr` (reserve + `set_len`) tied the
-  zero-filled version and was reverted — fresh pages cost the same
-  faulted once either way. `--no-wasm-tier-up` and `--liftoff-only`
-  (via `setFlagsFromString` in `main.ts`) both lost by ~4–6 ms: even
-  for a single cold call, tier-up pays. The rest of the driver's cost
-  is Node's own startup, which the control process pays too.
+First, a profile split (a walk-only build — envelope scan + unescape,
+no CSV parse — against the full build, same session): the envelope
+walk + unescape costs **~49 ms net**, the CSV parse + emission
+**~84 ms**. Neither stage is memory-bandwidth-bound (the unescape moves
+~19 MB in 49 ms); both are compute/latency-bound. That predicted the
+windowing result:
 
-**Net result: v10 ≈ 5–8% faster than v9 interleaved** (final matched
-batch, 9 rounds: v9 net 114.6 ms, v10 net 109.3 ms) — a small, real
-improvement, honestly short of the 20% hoped for: after v9, what
-remains is roughly half warm compute in a reader that is already
-span-based, and half first-call/process overhead that resisted the
-warm-up, size and flag attacks tried across both versions.
+- **Windowed streaming — built, correct, and rejected.** The envelope
+  walk recorded each text's raw span (header known before parsing
+  starts), a budget-limited unescape fed the transducer ~256 KiB of
+  text at a time, and the transducer became resumable: a record that
+  reaches the end of a non-final feed is unwound whole (output, errors
+  and counters rolled back to the record's start) and re-read when the
+  next window lands. Practice output was byte-identical — and the
+  windowed build netted **~145 ms against ~111 ms** for the whole-buffer
+  build in the same session, a ~30% loss: the extra span pass, the
+  per-window call overhead and the re-read tail records cost far more
+  than cache locality returns on a compute-bound pipeline. The
+  whole-buffer architecture stays.
+- **Liftoff-only, done right — kept (locally a tie).** Flags-first ESM
+  driver + dynamic import + synchronous instantiation + no warm-up:
+  net 120.7 ms vs v10's 118.8 in one 9-round session, 120.7 vs 117.6 in
+  the final 11-round session — inside the noise both times, never a
+  loss outside it. `--no-wasm-tier-up` alone tied as well (116.2).
+  Kept because the tie is free and the cold-run argument is structural:
+  on the timing lane there is no second call, so optimizing-tier
+  compilation can only spend, never repay.
+- **CommonJS driver — tied, not shipped.** A `require()`-style
+  `main.ts` (relying on Node's syntax detection, `require()` of the
+  now TLA-free `solve.js`) netted 116.1 — the same tie. The ESM driver
+  plus `"type": "module"` says the same thing without depending on
+  detection order.
+- **`"type": "module"` — kept.** Micro-benchmarks (median of 15 fresh
+  processes): an empty `.mjs` costs ~100 ms of this machine's CPU, an
+  empty `.ts` ~155 ms — type stripping itself is ~50 ms every
+  `main.ts` entry pays, control included — and declaring the module
+  type removes the ~7 ms reparse slice of it.
+- **Wasm diet — nothing left to strip.** The 46,232-byte module has no
+  custom sections at all (no name section; the profile already strips):
+  section walk shows type/function/memory/global/export/element/code/
+  data only. A compile micro-benchmark (load + instantiate + one 1 KB
+  transduction, median of 15 fresh processes) puts the whole
+  load-and-compile at ~1 ms over bare Node startup — compilation is
+  not where the time is, so there was nothing further to win here.
+
+**Net result: v11 ties v10 locally (within ±3% in every matched
+session)** and ships the shell that spends nothing on cold-run waste:
+no warm-up, no optimizing tier, no reparse, one synchronous compile.
+The remaining time is the transducer's honest compute — ~49 ms of
+envelope + unescape and ~84 ms of parse + emission per 10 MB on this
+machine — which two rounds of fusion attempts (v10) and this round's
+windowing have all failed to beat.
 
 ## Correctness
 
@@ -138,13 +181,13 @@ warm-up, size and flag attacks tried across both versions.
 
 `sh build.sh` rebuilds `solve.js` from `rust/` (cargo with the
 `wasm32-unknown-unknown` target; `gen-solve.mjs` embeds the module as
-base64 — `node gen-solve.mjs file` regenerates the separate-file
-loading instead, for comparison). The checked-in `solve.js` is the
-built artifact; the entry needs nothing built at run time.
+base64 with synchronous instantiation — `node gen-solve.mjs file`
+regenerates the separate-file loading instead, for comparison). The
+checked-in `solve.js` is the built artifact; the entry needs nothing
+built at run time.
 
 ## License
 
-MIT (see `LICENSE`). The JavaScript fallback reader in `solve.js` is
-this project's own earlier work; the WebAssembly transducer is an
-independent reimplementation written against csv-reader 1.0.0's
-documented and observed behaviour.
+MIT (see `LICENSE`). The WebAssembly transducer is an independent
+reimplementation written against csv-reader 1.0.0's documented and
+observed behaviour.
